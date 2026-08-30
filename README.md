@@ -1,9 +1,29 @@
-# detect2 — UnifOMR RLWEenc study & simulation
+# detect — UnifOMR Detection
 
 A Rust library (plus SageMath scripts and a writeup) studying and
 simulating the RLWEenc layer of **UnifOMR** — oblivious message
-detection/retrieval — instantiated at **Parameter Set 1** (Table 1,
-Section 7.1 of the paper):
+detection/retrieval.
+
+## Overview
+
+1. Each wallet has a 5.6k public key for receiving payments from senders.
+2. The wallet uploads a 27Mb detection key to server.
+3. Senders attach 2.8k clue key which takes 2s to generate to their payments.
+4. Servers can send a window of 2048 payments back to the wallet for detection
+   at once. The window takes 15ms to compute or 0.7s for 100k payments.
+   This is done per wallet.
+5. Wallets receive the packed reply back which is 400Kb for 100k payments.
+   They decrypt the packed reply in 0.3ms for 100k payments and get a list of
+   indices indicating which payments in the window belong to them.
+
+See `example/full_usage.rs` for more info.
+
+The crypto is quite simple although there are some nuances. The security
+parameters are taken as-is from the UnifOMR paper.
+
+## Parameters
+
+Using **Parameter Set 1** (Table 1, Section 7.1 of the paper):
 
 | symbol | value | meaning |
 |---|---|---|
