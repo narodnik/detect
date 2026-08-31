@@ -3,6 +3,8 @@ name = "detect"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+
 [lib]
 name = "detect2"
 path = "src/lib.rs"
@@ -13,6 +15,3 @@ rand = "0.8.6"
 [[bench]]
 name = "bench_param1"
 harness = false
-
-[lints]
-workspace = true

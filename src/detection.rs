@@ -1,11 +1,12 @@
-//! The detector side of UnifOMR (UnifOMD): SIMD partial decryption of
-//! many clues via coefficient packing, plus the pertinence decision.
+//! The detector side of UnifOMR (UnifOMD): packed partial decryption of
+//! many clues against an *encrypted* detection key, plus the pertinence
+//! decision.
 //!
-//! Mirrors §3.4 of `crypto.md` / `script/packing.sage`. The detector's
-//! plaintext ring is $\mathbb{Z}_t[X]/(X^{D}+1)$ with $t = q$ and
-//! $D = 2048$ slots; the homomorphic layer is *simulated on plaintexts*
-//! (constant $\times$ polynomial), which preserves the algorithm's cost
-//! shape: $n$ scalar multiplications serve $D$ clues at once.
+//! Mirrors §3.4 of `crypto.md` / `script/packing.sage` and Algorithm 1
+//! of the paper. The BFV plaintext ring is $\mathbb{Z}_t[X]/(X^{D}+1)$
+//! with $t = q$ and $D = 2048$ slots; the homomorphic layer is a real
+//! (minimal) BFV scheme ([`crate::bfv`]), so the server only ever
+//! touches ciphertexts.
 //!
 //! Pipeline for decoded bit $k$ and clues $j = 0, \dots$:
 //!
@@ -14,15 +15,28 @@
 //!    $(a^{(j)} s)_k = \sum_i A_j[k][i]\, s_i$ with
 //!    $A[k][i] = \pm a_{(k-i) \bmod N}$ (sign flip exactly when the
 //!    product wraps past $X^N = -1$).
-//! 2. **Pack.** $p_i(X) = \sum_j A_j[k][i]\, X^j$: clue $j$'s scalar in
+//! 2. **Detect.** The recipient uploads a detection key
+//!    ([`detection_key`]): every secret coefficient $s_w$ encrypted as
+//!    a BFV constant under the recipient's own BFV key.
+//! 3. **Pack.** $p_w(X) = \sum_j A_j[k][w]\, X^j$: clue $j$'s scalar in
 //!    coefficient $j$ of one plaintext polynomial.
-//! 3. **Multiply.** $\sum_i p_i \cdot s_i$, where $s_i$ enters as an
-//!    encrypted constant; coefficient $j$ of the result is
-//!    $(a^{(j)} s)_k$, all clues at once.
-//! 4. **Decide.** Per clue, $d_j = b^{(j)}[k] - (a^{(j)} s)_k$; the
-//!    message is *pertinent* iff every decoded bit is 0, i.e.
-//!    $|d_j| \le r$ for all payload positions.
+//! 4. **Multiply.** $\sum_w p_w \cdot \mathrm{ct}_{s_w}$, homomorphically:
+//!    coefficient $j$ of the still-encrypted result is
+//!    $(a^{(j)} s)_k$, all clues at once; the packed public
+//!    $b^{(j)}[k]$ term is folded in at message scale and the
+//!    ciphertext is modulus-switched to $Q'$ ([`packed_reply`]).
+//! 5. **Decide.** The client decrypts with the BFV secret key and
+//!    range-checks $|v_j| \le r' Q'/t$ ([`client_decode`]) — the
+//!    message is *pertinent* iff every decoded bit is 0.
+//!
+//! [`packed_partial_decrypt`] / [`detect`] evaluate the same algebra on
+//! the *raw* secret key — a plaintext simulation kept as a cross-check
+//! oracle for the encrypted path (and as the bench's arithmetic-only
+//! microbenchmark).
 
+use rand::Rng;
+
+use crate::bfv;
 use crate::field_alg::{Fp, PolyFp, Rq};
 use crate::param;
 use crate::rlwenc::{Ciphertext, SecretKey, SkParam1};
@@ -96,7 +110,10 @@ pub fn direct_partial_decrypt<const P: u64, const N: usize>(
     sk: &SecretKey<P, N>,
     k: usize,
 ) -> Vec<i64> {
-    a_list.iter().map(|a| (a * sk.as_poly()).coeff_centered(k)).collect()
+    a_list
+        .iter()
+        .map(|a| (a * sk.as_poly()).coeff_centered(k))
+        .collect()
 }
 
 /// The pertinence decision from the centered decryption values of all
@@ -159,27 +176,116 @@ pub fn detect<const P: u64, const N: usize, const D: usize>(
     out
 }
 
-/// The server's packed reply for one recipient at Parameter Set 1:
-/// SIMD partial decryption of decoded bit $k = 0$ for every clue in
-/// the window — $n = 900$ scalar broadcasts of dimension $D = 2048$,
-/// one clue per slot — yielding the centered $(a^{(j)} s)_0$ value per
-/// clue.
+/// The recipient's public detection key (Algorithm 1, KeyGen):
+/// $\mathrm{pk}_{det} = (\mathrm{pk}_{BFV}, \mathrm{ct}_{s_0}, \dots,
+/// \mathrm{ct}_{s_{n-1}})$ — one BFV ciphertext per RLWEenc secret-key
+/// coefficient, each encrypting $s_w \in \{-1, 0, 1\}$ as a *constant*
+/// polynomial under the recipient's own BFV key.
 ///
-/// In the real scheme these values leave the server as $\ell$ elements
-/// of $\mathbb{Z}_{Q'}$ per message (4 B each after modulus
-/// switching); the recipient finishes with [`client_detect`].
-pub fn packed_reply(a_list: &[Rq], sk: &SkParam1) -> Vec<i64> {
-    packed_partial_decrypt::<{ param::Q }, { param::N_RING }, { param::D_BFV }>(
-        a_list, sk, 0, param::N,
-    )
+/// The server evaluates the packed partial decryption purely against
+/// these ciphertexts ([`packed_reply`]); the matching BFV secret key
+/// never leaves the client, so the server cannot finish any decryption
+/// — including the pertinence range check — for itself.
+pub struct DetectionKey {
+    /// The BFV public key under which the secret coefficients are
+    /// encrypted (part of the paper's $\mathrm{pk}_{det}$; the
+    /// detection circuit itself only reads `cts`).
+    pub pk: bfv::PkParam1,
+    /// The encrypted secret coefficients $\mathrm{ct}_{s_w}$, $w \in [n]$.
+    pub cts: Vec<bfv::CtParam1>,
+}
+
+/// Recipient-side detection-key generation (Algorithm 1, KeyGen): draw
+/// a BFV key pair and encrypt every RLWEenc secret coefficient as a
+/// constant. Returns the uploadable public detection key together with
+/// the client-held BFV secret key ([`bfv::SkParam1`]).
+///
+/// At Parameter Set 1 this is $n = 900$ BFV ciphertexts of
+/// $2 \times D$ coefficients at 60 bits — 27,648,000 B packed.
+pub fn detection_key<R: Rng>(rng: &mut R, sk: &SkParam1) -> (DetectionKey, bfv::SkParam1) {
+    let (bfv_sk, bfv_pk) = bfv::keygen_param1(rng);
+    let cts = (0..param::N)
+        .map(|w| bfv::encrypt_param1(rng, &bfv_pk, sk.as_poly().coeff(w).lift_centered()))
+        .collect();
+    (DetectionKey { pk: bfv_pk, cts }, bfv_sk)
+}
+
+/// The server's packed reply for one recipient over a window of clues
+/// (Algorithm 1, Retrieve0): the homomorphic SIMD partial decryption of
+/// decoded bit $k = 0$ for every clue, evaluated against the encrypted
+/// detection key only — the server never sees a secret key or a
+/// decrypted value.
+///
+/// 1. For each secret position $w \in [n]$, pack the linear-form
+///    scalars $p_w(X) = \sum_j A_j[0][w] X^j$ (clue $j$'s scalar in
+///    coefficient $j$) and plaintext-multiply the detection-key
+///    ciphertext $\mathrm{ct}_{s_w}$ by it — $n = 900$ plain-mults of
+///    dimension $D = 2048$, one clue per slot, all clues at once.
+/// 2. Sum over $w$, negate, and homomorphically add the packed public
+///    $b$-term: the ciphertext now encrypts the decryption value
+///    $d_j = b^{(j)}[0] - (a^{(j)} s)_0$ itself, at message scale.
+/// 3. Modulus-switch $Q \to Q'$.
+///
+/// The reply is one BFV ciphertext in $R_{Q'}^2$: $2D$ coefficients of
+/// 26 bits, 13,312 B per window of up to $D = 2048$ clues (6.5 B per
+/// message) — and it is opaque to everyone but the holder of the BFV
+/// secret key, who finishes with [`client_decode`].
+pub fn packed_reply(
+    cts: &[Ciphertext<{ param::Q }, { param::N_RING }>],
+    dk: &DetectionKey,
+) -> bfv::CtQpParam1 {
+    debug_assert!(cts.len() <= param::D_BFV);
+    let a_list: Vec<Rq> = cts.iter().map(|ct| ct.a.clone()).collect();
+    let mut acc = bfv::CtParam1::zero();
+    for w in 0..param::N {
+        let p_w =
+            pack_scalar_column::<{ param::Q }, { param::N_RING }, { param::D_BFV }>(&a_list, 0, w)
+                .lift_to::<{ param::Q_BFV }>();
+        acc = &acc + &bfv::plain_mul(&dk.cts[w], &p_w);
+    }
+    let mut b_coeffs = [0u64; param::D_BFV];
+    for (j, ct) in cts.iter().enumerate() {
+        b_coeffs[j] = ct.b[0].raw();
+    }
+    let b_packed = PolyFp::<{ param::Q_BFV }, { param::D_BFV }>::from_raw(b_coeffs);
+    let with_b = bfv::add_plaintext(&(-&acc), &b_packed, param::T);
+    bfv::mod_switch_param1(&with_b)
+}
+
+/// The client's detection pass over an encrypted reply (Algorithm 1,
+/// Decode0): decrypt $c_0' - c_1' s_{BFV}$ in $R_{Q'}$, read
+/// coefficient $j$ centered for each clue $j$ of the window, and mark
+/// the clue pertinent iff $|v_j| \le r' \cdot Q'/t$.
+///
+/// $v_j$ is the decryption value $d_j$ scaled by $Q'/t \approx 16.1$
+/// plus the merged BFV/modulus-switch error, so the check is the
+/// encrypted-flow counterpart of the plaintext range check $|d_j| \le
+/// r$: a clue addressed to this recipient decrypts to $0^\ell$ (the
+/// pertinence signal, senders encrypt $m = 0$), while under anyone
+/// else's key $d_j$ is pseudorandom over $\mathbb{Z}_t$ and fails with
+/// probability $\approx 1 - 2r'/Q'$.
+///
+/// Returns the indices of the pertinent clues, in order. Only the
+/// holder of `bfv_sk` can perform this step — the server, holding just
+/// the detection key, cannot.
+pub fn client_decode(
+    reply: &bfv::CtQpParam1,
+    bfv_sk: &bfv::SkParam1,
+    num_clues: usize,
+) -> Vec<usize> {
+    debug_assert!(num_clues <= param::D_BFV);
+    let v = bfv::decrypt_phase_param1(bfv_sk, reply);
+    (0..num_clues)
+        .filter(|j| v.coeff_centered(*j).abs() <= param::REPLY_RANGE)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rlwenc::{decrypt, keygen, keygen_param1, encrypt_param1};
-    use rand::rngs::ThreadRng;
+    use crate::rlwenc::{decrypt, encrypt_param1, keygen, keygen_param1};
     use rand::Rng;
+    use rand::rngs::ThreadRng;
 
     type ToyRing = PolyFp<17, 4>;
     type ToySk = SecretKey<17, 4>;
@@ -227,8 +333,9 @@ mod tests {
         let mut rng = ThreadRng::default();
         for _ in 0..50 {
             let (sk, _): (ToySk, _) = keygen::<17, 4, 2, _>(&mut rng, 4);
-            let clues: Vec<ToyRing> =
-                (0..4).map(|_| ToyRing::from_raw(std::array::from_fn(|_| rng.gen_range(0..17)))).collect();
+            let clues: Vec<ToyRing> = (0..4)
+                .map(|_| ToyRing::from_raw(std::array::from_fn(|_| rng.gen_range(0..17))))
+                .collect();
             let packed = packed_partial_decrypt::<17, 4, 4>(&clues, &sk, 0, 4);
             let direct = direct_partial_decrypt(&clues, &sk, 0);
             assert_eq!(packed, direct);
@@ -259,9 +366,52 @@ mod tests {
         );
         assert_eq!(client_detect(&reply, &cts, 0, param::R), vec![0]);
 
-        let reply = packed_reply(&cts.iter().map(|ct| ct.a.clone()).collect::<Vec<_>>(), &sk);
+        let reply = packed_partial_decrypt::<{ param::Q }, { param::N_RING }, { param::D_BFV }>(
+            &cts.iter().map(|ct| ct.a.clone()).collect::<Vec<_>>(),
+            &sk,
+            0,
+            param::N,
+        );
         assert_eq!(reply.len(), 2);
         assert_eq!(client_detect(&reply, &cts, 0, param::R), vec![0]);
+    }
+
+    #[test]
+    fn param1_encrypted_detection_flow() {
+        let mut rng = ThreadRng::default();
+        let (sk, pk) = keygen_param1(&mut rng);
+        let (_, other_pk) = keygen_param1(&mut rng);
+
+        let cts = [
+            encrypt_param1(&mut rng, &pk, &[false]),
+            encrypt_param1(&mut rng, &other_pk, &[false]),
+            encrypt_param1(&mut rng, &pk, &[false]),
+        ];
+
+        let (dk, bfv_sk) = detection_key(&mut rng, &sk);
+        let reply = packed_reply(&cts, &dk);
+        assert_eq!(client_decode(&reply, &bfv_sk, cts.len()), vec![0, 2]);
+
+        // the encrypted path agrees with the plaintext simulation
+        let sim = detect::<{ param::Q }, { param::N_RING }, { param::D_BFV }>(
+            &cts,
+            &sk,
+            0,
+            param::N,
+            param::R,
+        );
+        assert_eq!(sim, vec![true, false, true]);
+
+        // a third recipient's detection key finds nothing: their BFV
+        // decryption is exact, but every d_j is pseudorandom under a
+        // clue key that is not theirs
+        let (third_sk, _) = keygen_param1(&mut rng);
+        let (third_dk, third_bfv_sk) = detection_key(&mut rng, &third_sk);
+        let third_reply = packed_reply(&cts, &third_dk);
+        assert_eq!(
+            client_decode(&third_reply, &third_bfv_sk, cts.len()),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]

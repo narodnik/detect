@@ -79,6 +79,17 @@ pub const Q_PRIME: u64 = 67104769;
 /// $\mathrm{eModSW} \le h_{\mathrm{BFV}}/2$.
 pub const R_PRIME: i64 = 992;
 
+/// The client-side pertinence threshold in $\mathbb{Z}_{Q'}$: a clue is
+/// pertinent iff the decrypted reply coefficient $v_j$ satisfies
+/// $|v_j| \le r' \cdot Q'/t$ (Algorithm 1, Decode0).
+///
+/// $v_j$ is the decryption value $d_j$ scaled by $Q'/t \approx 16.1$,
+/// so the threshold holds iff $d_j$ sits inside the merged error range
+/// $r'$; an impertinent clue decrypts to a uniform point of
+/// $\mathbb{Z}_t$ and lands within $r' \cdot Q'/t$ of 0 only with
+/// probability $\approx 2r'/Q' \approx \epsilon_p$.
+pub const REPLY_RANGE: i64 = ((R_PRIME as u64 * Q_PRIME) / T) as i64;
+
 /// Standard deviation of the accumulated RLWEenc decryption noise,
 /// $\sqrt{2h+1}\,\sigma$ (Definition 4.6).
 pub fn effective_noise_std() -> f64 {
@@ -211,7 +222,9 @@ mod tests {
         assert!((erfc(1.0) - 0.15729920705028513).abs() < 1e-14);
         assert!((erfc(2.0) - 0.004677734981047265).abs() < 1e-16);
         let deep = erfc(4.4593);
-        assert!(deep > 0.0 && (deep - 2.8559567523976677e-10).abs() / 2.8559567523976677e-10 < 1e-12);
+        assert!(
+            deep > 0.0 && (deep - 2.8559567523976677e-10).abs() / 2.8559567523976677e-10 < 1e-12
+        );
         assert!((erfc(5.0) - 1.5374597944280351e-12).abs() / 1.5374597944280351e-12 < 1e-12);
     }
 
@@ -258,5 +271,13 @@ mod tests {
         assert_eq!(k, 61);
         let eps_p = (2 * k + 1) as f64 / T as f64;
         assert!(eps_p <= EPS_P);
+    }
+
+    #[test]
+    fn reply_range_matches_its_derivation() {
+        assert_eq!(REPLY_RANGE, ((R_PRIME as u64 * Q_PRIME) / T) as i64);
+        assert_eq!(REPLY_RANGE, 15964);
+        assert!(REPLY_RANGE < (Q_PRIME / 2) as i64);
+        assert!(REPLY_RANGE > R_PRIME * (Q_PRIME / T) as i64);
     }
 }

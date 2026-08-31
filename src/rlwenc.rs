@@ -18,11 +18,7 @@
 
 use rand::Rng;
 
-use crate::error::{
-    sample_error_ring,
-    sample_secret_ring,
-    sample_uniform_ring,
-};
+use crate::error::{sample_error_ring, sample_secret_ring, sample_uniform_ring};
 use crate::field_alg::{Fp, PolyFp};
 use crate::param;
 
@@ -69,7 +65,10 @@ pub fn keygen<const P: u64, const N: usize, const H: usize, R: Rng>(
     let alpha = sample_uniform_ring::<P, N, R>(rng);
     let x = sample_error_ring::<P, N, R>(rng);
     let sk = SecretKey(s.clone());
-    let pk = PublicKey { beta: &(&alpha * &s) + &x, alpha };
+    let pk = PublicKey {
+        beta: &(&alpha * &s) + &x,
+        alpha,
+    };
     (sk, pk)
 }
 
@@ -86,7 +85,10 @@ pub fn encrypt_with<const P: u64, const N: usize>(
 ) -> Ciphertext<P, N> {
     debug_assert!(message.len() <= N);
     let t = PolyFp::<P, N>::from_i64_coeffs(
-        &message.iter().map(|m| if *m { (P / 2) as i64 } else { 0 }).collect::<Vec<_>>(),
+        &message
+            .iter()
+            .map(|m| if *m { (P / 2) as i64 } else { 0 })
+            .collect::<Vec<_>>(),
     );
     let a = &(&pk.alpha * y) + x1;
     let b_full = &(&(&pk.beta * y) + &t) + x2;
@@ -118,8 +120,7 @@ pub fn decrypt<const P: u64, const N: usize>(
     r: i64,
 ) -> Vec<bool> {
     let as_poly = &ct.a * sk.as_poly();
-    ct.b
-        .iter()
+    ct.b.iter()
         .enumerate()
         .map(|(i, b)| (*b - as_poly.coeff(i)).lift_centered().abs() > r)
         .collect()
@@ -132,7 +133,10 @@ pub fn decryption_values<const P: u64, const N: usize>(
     ct: &Ciphertext<P, N>,
 ) -> Vec<i64> {
     let as_poly = &ct.a * sk.as_poly();
-    ct.b.iter().enumerate().map(|(i, b)| (*b - as_poly.coeff(i)).lift_centered()).collect()
+    ct.b.iter()
+        .enumerate()
+        .map(|(i, b)| (*b - as_poly.coeff(i)).lift_centered())
+        .collect()
 }
 
 /// RLWEenc secret key at Parameter Set 1.
@@ -174,7 +178,10 @@ mod tests {
         let alpha = ToyRing::from_i64_coeffs(&[3, 5, -2, 1]);
         let s = ToyRing::from_i64_coeffs(&[1, 0, 0, -1]);
         let x = ToyRing::from_i64_coeffs(&[1, -1]);
-        let pk = PublicKey { beta: &(&alpha * &s) + &x, alpha: alpha.clone() };
+        let pk = PublicKey {
+            beta: &(&alpha * &s) + &x,
+            alpha: alpha.clone(),
+        };
         assert_eq!(pk.beta.coeff_centered(0), -8);
 
         let y = ToyRing::from_i64_coeffs(&[-1, 0, 1, 0]);

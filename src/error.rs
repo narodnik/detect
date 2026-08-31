@@ -7,11 +7,11 @@
 //!   $\{-1, 0, 1\}^{n}$ of Hamming weight $h$;
 //! - uniform over $R_q$ for the public $\alpha$.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
+use rand::Rng;
 use rand::rngs::ThreadRng;
 use rand::seq::SliceRandom;
-use rand::Rng;
 
 use crate::field_alg::{PolyFp, Rq};
 use crate::param;
@@ -25,21 +25,35 @@ struct DiscreteGaussian {
     total: f64,
 }
 
-fn build_discrete_gaussian() -> DiscreteGaussian {
-    let cutoff = (12.0 * param::SIGMA).ceil() as i64;
+fn build_discrete_gaussian(sigma: f64) -> DiscreteGaussian {
+    let cutoff = (12.0 * sigma).ceil() as i64;
     let support: Vec<i64> = (-cutoff..=cutoff).collect();
     let mut cumsum = Vec::with_capacity(support.len());
     let mut acc = 0.0f64;
     for k in &support {
-        acc += f64::exp(-((*k as f64) * (*k as f64)) / (2.0 * param::SIGMA * param::SIGMA));
+        acc += f64::exp(-((*k as f64) * (*k as f64)) / (2.0 * sigma * sigma));
         cumsum.push(acc);
     }
-    DiscreteGaussian { support, cumsum, total: acc }
+    DiscreteGaussian {
+        support,
+        cumsum,
+        total: acc,
+    }
 }
 
-fn discrete_gaussian() -> &'static DiscreteGaussian {
-    static TABLE: OnceLock<DiscreteGaussian> = OnceLock::new();
-    TABLE.get_or_init(build_discrete_gaussian)
+/// The table for `sigma`, built on first use and cached for the
+/// process lifetime (tables are keyed by the bit pattern of `sigma`).
+fn discrete_gaussian(sigma: f64) -> &'static DiscreteGaussian {
+    static CACHE: OnceLock<Mutex<Vec<(u64, &'static DiscreteGaussian)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let key = sigma.to_bits();
+    let mut tables = cache.lock().unwrap();
+    if let Some((_, table)) = tables.iter().find(|(k, _)| *k == key) {
+        return table;
+    }
+    let table: &'static DiscreteGaussian = Box::leak(Box::new(build_discrete_gaussian(sigma)));
+    tables.push((key, table));
+    table
 }
 
 /// One coefficient draw from $\chi_\sigma$, i.e. $k \leftarrow
@@ -49,7 +63,14 @@ fn discrete_gaussian() -> &'static DiscreteGaussian {
 /// The support is cut at $\pm\lceil 12\sigma \rceil = \pm 8$; the mass
 /// beyond is $e^{-72} \sim 10^{-31}$.
 pub fn chi_coeff<R: Rng>(rng: &mut R) -> i64 {
-    let table = discrete_gaussian();
+    chi_coeff_sigma(rng, param::SIGMA)
+}
+
+/// Generic-$\sigma$ version of [`chi_coeff`], e.g. the BFV error
+/// distribution $\chi_{\sigma_{\mathrm{BFV}}}$ with $\sigma_{\mathrm{BFV}} = 3.2$
+/// (support cut at $\pm 38$).
+pub fn chi_coeff_sigma<R: Rng>(rng: &mut R, sigma: f64) -> i64 {
+    let table = discrete_gaussian(sigma);
     let u = rng.gen_range(0.0..table.total);
     let idx = table.cumsum.partition_point(|c| *c <= u);
     table.support[idx.min(table.support.len() - 1)]
@@ -77,7 +98,16 @@ pub fn sample_error<R: Rng>(rng: &mut R) -> Rq {
 
 /// Generic-ring version of [`sample_error`].
 pub fn sample_error_ring<const P: u64, const N: usize, R: Rng>(rng: &mut R) -> PolyFp<P, N> {
-    let coeffs: Vec<i64> = (0..N).map(|_| chi_coeff(rng)).collect();
+    sample_error_sigma::<P, N, R>(rng, param::SIGMA)
+}
+
+/// Generic-ring error sampling at an arbitrary $\sigma$, e.g. the BFV
+/// layer's $\chi_{\sigma_{\mathrm{BFV}}}$.
+pub fn sample_error_sigma<const P: u64, const N: usize, R: Rng>(
+    rng: &mut R,
+    sigma: f64,
+) -> PolyFp<P, N> {
+    let coeffs: Vec<i64> = (0..N).map(|_| chi_coeff_sigma(rng, sigma)).collect();
     PolyFp::from_i64_coeffs(&coeffs)
 }
 
@@ -133,7 +163,11 @@ mod tests {
         assert!((chi_probability(1) - 0.16552374765776978).abs() < 1e-12);
         assert!((chi_probability(2) - 0.002566255950845424).abs() < 1e-12);
         assert_eq!(chi_probability(9), 0.0);
-        let total: f64 = discrete_gaussian().support.iter().map(|k| chi_probability(*k)).sum();
+        let total: f64 = discrete_gaussian(param::SIGMA)
+            .support
+            .iter()
+            .map(|k| chi_probability(*k))
+            .sum();
         assert!((total - 1.0).abs() < 1e-12);
     }
 
@@ -143,8 +177,11 @@ mod tests {
         let n = 200_000;
         let draws: Vec<i64> = (0..n).map(|_| chi_coeff(&mut rng)).collect();
         let mean = draws.iter().sum::<i64>() as f64 / n as f64;
-        let var =
-            draws.iter().map(|k| (*k as f64 - mean) * (*k as f64 - mean)).sum::<f64>() / n as f64;
+        let var = draws
+            .iter()
+            .map(|k| (*k as f64 - mean) * (*k as f64 - mean))
+            .sum::<f64>()
+            / n as f64;
         let std = var.sqrt();
         assert!(mean.abs() < 0.01);
         assert!((std - 0.5931).abs() < 0.005);

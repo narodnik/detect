@@ -2,16 +2,19 @@
 //! $D = 2048$ clues, mirroring the data flow of UnifOMR:
 //!
 //! ```text
-//! client --detection key--> server   (n BFV ciphertexts, simulated)
+//! client --detection key--> server   (n = 900 real BFV ciphertexts)
 //! senders --2048 clues----> server   (RLWEenc ciphertexts)
-//! server --packed reply---> client   (ell elements of Z_Q' per message)
+//! server --packed reply---> client   (1 modulus-switched BFV ct)
+//! client --decode---------> indices  (decrypt + range check)
 //! ```
 //!
 //! Reports the byte sizes of each flow (packed-minimal for the
-//! ciphertexts we implement; analytic for the BFV layer we simulate)
-//! and wall-clock times, each phase repeated over several windows:
-//! clue generation, the server's packed partial decryption, and the
-//! client's detection pass.
+//! ciphertexts we implement) and wall-clock times for each phase:
+//! clue generation, detection-key generation, the server's packed
+//! homomorphic reply (real BFV; one iteration, since the packed
+//! plaintexts are dense over a full window and this implementation is
+//! NTT-free schoolbook), the plaintext-simulation arithmetic pass for
+//! comparison, and the client's decode.
 //!
 //! Run with:
 //!
@@ -21,13 +24,16 @@
 
 use std::time::Instant;
 
-use detect2::detection::{detect, is_pertinent, packed_partial_decrypt};
+use detect2::client_decode;
+use detect2::detection::{
+    detect, detection_key, is_pertinent, packed_partial_decrypt, packed_reply,
+};
 use detect2::param;
-use detect2::rlwenc::{encrypt_param1, keygen_param1, Ciphertext};
+use detect2::rlwenc::{Ciphertext, encrypt_param1, keygen_param1};
 use rand::rngs::ThreadRng;
 
 const CLUE_WINDOWS: usize = 3;
-const PACK_ITERATIONS: usize = 20;
+const SIM_ITERATIONS: usize = 20;
 const CLIENT_ITERATIONS: usize = 20;
 
 fn main() {
@@ -55,11 +61,15 @@ fn main() {
         clue_times.push(t0.elapsed());
     }
 
+    let t_dk = Instant::now();
+    let (dk, bfv_sk) = detection_key(&mut rng, &sk);
+    let dk_time = t_dk.elapsed();
+
     let a_list: Vec<_> = cts.iter().map(|ct| ct.a.clone()).collect();
 
-    let mut pack_times = Vec::with_capacity(PACK_ITERATIONS);
+    let mut sim_times = Vec::with_capacity(SIM_ITERATIONS);
     let mut packed = Vec::new();
-    for _ in 0..PACK_ITERATIONS {
+    for _ in 0..SIM_ITERATIONS {
         let t1 = Instant::now();
         packed = packed_partial_decrypt::<{ param::Q }, { param::N_RING }, { param::D_BFV }>(
             &a_list,
@@ -67,19 +77,67 @@ fn main() {
             0,
             param::N,
         );
-        pack_times.push(t1.elapsed());
+        sim_times.push(t1.elapsed());
     }
+
+    println!("--- timings (server window = n = 900 plain-mults of dim D, serving D clues) ---");
+    report(
+        "clue generation (senders)",
+        &clue_times,
+        num_clues,
+        "us",
+        1e6,
+    );
+    println!(
+        "{name:28}: {secs:8.3} s/one-off   ({n} BFV encryptions of a constant)",
+        name = "detection key gen (client)",
+        secs = dk_time.as_secs_f64(),
+        n = param::N
+    );
+
+    let t2 = Instant::now();
+    let reply = packed_reply(&cts, &dk);
+    let reply_time = t2.elapsed();
+    println!(
+        "{name:28}: {secs:8.3} s/window   (real BFV: n plain-mults + mod switch, schoolbook, 1 iteration)",
+        name = "packed reply (server)",
+        secs = reply_time.as_secs_f64()
+    );
+    report(
+        "packed partial decrypt (sim)",
+        &sim_times,
+        num_clues,
+        "us",
+        1e6,
+    );
 
     let mut client_times = Vec::with_capacity(CLIENT_ITERATIONS);
-    let mut decisions = Vec::new();
+    let mut detections = Vec::new();
     for _ in 0..CLIENT_ITERATIONS {
-        let t2 = Instant::now();
-        decisions = client_pass(&cts, &packed);
-        client_times.push(t2.elapsed());
+        let t3 = Instant::now();
+        detections = client_decode(&reply, &bfv_sk, num_clues);
+        client_times.push(t3.elapsed());
     }
+    report(
+        "decode + range check (client)",
+        &client_times,
+        num_clues,
+        "ns",
+        1e9,
+    );
 
-    let detected = decisions.iter().filter(|d| **d).count();
+    let detected = detections.len();
     assert_eq!(detected, num_pertinent);
+
+    let decisions = sim_pass(&cts, &packed);
+    let sim_detected = decisions.iter().filter(|d| **d).count();
+    assert_eq!(sim_detected, num_pertinent);
+    for d in &detections {
+        assert!(
+            decisions[*d],
+            "clue {d} flagged by decode but not by the sim"
+        );
+    }
     let cross = detect::<{ param::Q }, { param::N_RING }, { param::D_BFV }>(
         &cts[..16],
         &sk,
@@ -89,21 +147,14 @@ fn main() {
     );
     assert_eq!(&cross[..8], &decisions[..8]);
 
-    println!(
-        "--- timings ({} windows each; server window = n = {} scalar broadcasts of dim {}, serving D = {} clues) ---",
-        CLUE_WINDOWS.max(PACK_ITERATIONS),
-        param::N,
-        param::D_BFV,
-        param::D_BFV
-    );
-    report("clue generation (senders)", &clue_times, num_clues, "us", 1e6);
-    report("packed partial decrypt (server)", &pack_times, num_clues, "us", 1e6);
-    report("detection pass (client)", &client_times, num_clues, "ns", 1e9);
     println!();
-    println!("sanity: {detected}/{} pertinent detected, cross-check vs detect() ok", num_pertinent);
+    println!(
+        "sanity: {detected}/{} pertinent detected over the encrypted path, sim agrees, cross-check vs detect() ok",
+        num_pertinent
+    );
 }
 
-fn client_pass(cts: &[Ciphertext<{ param::Q }, { param::N_RING }>], packed: &[i64]) -> Vec<bool> {
+fn sim_pass(cts: &[Ciphertext<{ param::Q }, { param::N_RING }>], packed: &[i64]) -> Vec<bool> {
     let q = param::Q as i64;
     cts.iter()
         .enumerate()
@@ -135,8 +186,8 @@ fn data_sizes(num_clues: usize) {
     let ring_elem = (param::N_RING as u64 * q_bits).div_ceil(8);
     let b_bytes = (param::ELL as u64 * q_bits).div_ceil(8);
     let clue = ring_elem + b_bytes;
-    let reply_per = (param::ELL as u64 * q_prime_bits).div_ceil(8);
     let bfv_ct = 2 * param::D_BFV as u64 * 60 / 8;
+    let reply_ct = 2 * param::D_BFV as u64 * q_prime_bits / 8;
 
     println!("--- data sizes (packed-minimal unless noted) ---");
     println!(
@@ -144,7 +195,7 @@ fn data_sizes(num_clues: usize) {
         pk = 2 * ring_elem
     );
     println!(
-        "detection key (client->server): {dk:9} B   ({n} BFV ciphertexts of 2 x {d} coeffs @ 60 bits; analytic, BFV simulated)",
+        "detection key (client->server): {dk:9} B   ({n} real BFV ciphertexts of 2 x {d} coeffs @ 60 bits)",
         dk = param::N as u64 * bfv_ct,
         n = param::N,
         d = param::D_BFV
@@ -167,17 +218,19 @@ fn data_sizes(num_clues: usize) {
         n = (100_000_f64 / num_clues as f64).ceil()
     );
     println!(
-        "reply for 100k messages   : {win:9} B   ({kib:6.2} KiB, {per} B/message)",
-        win = reply_per * 100_000,
-        kib = reply_per as f64 * 100_000.0 / 2f64.powi(10),
-        per = reply_per
+        "packed reply (server->client): {re:9} B   (1 switched BFV ct: 2 x {d} coeffs @ {qpb} bits = {per:8.2} B/message, Q' = {qp})",
+        re = reply_ct,
+        d = param::D_BFV,
+        qpb = q_prime_bits,
+        per = reply_ct as f64 / num_clues as f64,
+        qp = param::Q_PRIME
     );
     println!(
-        "packed reply (server->client): {re:9} B   ({per} B/message: ell elements of Z_Q', Q' = {qp})",
-        re = reply_per * num_clues as u64,
-        per = reply_per,
-        qp = param::Q_PRIME
-    );    println!(
+        "replies for 100k messages : {win:9} B   ({kib:6.2} KiB)",
+        win = reply_ct * (100_000 + num_clues as u64 - 1) / num_clues as u64,
+        kib = reply_ct as f64 * (100_000.0 / num_clues as f64).ceil() / 2f64.powi(10)
+    );
+    println!(
         "in-memory a storage       : {mem:9} B   (u64 per coefficient, this simulation)",
         mem = param::N_RING as u64 * 8 * num_clues as u64
     );
